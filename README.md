@@ -7,6 +7,7 @@ Ce dépôt contient le mémoire universitaire du groupe L.M.A.L sur la simulatio
 - `code mémoire.tex` : fichier principal LaTeX du mémoire
 - `note_technique_mémoire.pdf` : guide pas à pas pour reproduire ce mémoire
 - `mémoire-4.pdf` : version compilée du mémoire rendu
+- `code finale.txt` : le code du modele de simulation
 
 ## 📘 Objectif
 
