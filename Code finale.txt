@@ -1,0 +1,246 @@
+import pandas as pd
+import numpy as np
+import os
+from scipy.stats import multivariate_normal
+from openpyxl import load_workbook
+
+# Paramètres fixes de base
+N = 20             # Nombre d'équipes
+j = 4              # Première colonne des matchs dans le fichier d'entrée
+num_journees = 38  # Nombre total de journées
+
+# Entrées utilisateur pour la simulation
+N_journee = int(input("À partir de quelle journée souhaitez-vous générer les résultats ? "))
+journee_fin = int(input("Jusqu'à quelle journée souhaitez-vous arrêter la simulation ? "))
+T = int(input("Veuillez entrer le nombre de simulations Monte Carlo par match : "))
+
+# Configuration optimale fixe
+delta = 0.264
+bonus_domicile_FO = 1.05167
+bonus_domicile_FD = 1.05167
+alpha_factor = 1.02667
+beta_factor = 0.97
+malus_attacker = 0.89
+malus_midfield = 0.85
+malus_defense = 0.93
+
+# Paramètre supplémentaire
+correlation_rho = 0.3  # Corrélation pour la simulation
+
+# Chemins des fichiers
+input_file = "/Users/ilias/Desktop/memoire/Feuille_Memoire.xlsm"
+output_file = "/Users/ilias/Desktop/memoire/feuille_resultat2.xlsx"
+
+if not os.path.exists(input_file):
+    print(f"Erreur : Le fichier '{input_file}' n'existe pas.")
+    exit()
+
+# Données des joueurs clés
+key_players_data = """Liverpool FC	/attaquant/ 0.16402953931489195
+Arsenal FC	/milieux/ 0.03564268211182886
+Nottingham Forest	/defense/ 0.03737985048059811
+Manchester City	 /attaquant/ 0.33911269760326357
+Newcastle United	/attaquant/ 0.2943856332703213
+Chelsea FC	/attaquant/ 0.32062742452352844
+AFC Bournemouth	/attaquant/ 0.20937203817584704
+Aston Villa	/milieux/ 0.11800172265288555
+Brighton & Hove Albion	/defense/  0.20031217481789798
+FC Fulham		/attaquant/  0.08712121212121215
+FC Brentford		/attaquant/  0.0873362445414847
+Manchester United		/attaquant/  0.04793368079780036
+West Ham United		/defense/  0.18894009216589858
+Crystal Palace		/attaquant/  0.2065322314049587
+FC Everton		/defense/  0.08736545345881963
+Tottenham Hotspur		/defense/  0.23190215854463192
+Leicester City		/defense/  0.15384615384615385
+Wolverhampton Wanderers		/attaquant/  0.12717152976893242
+Ipswich Town		/attaquant/  0.20765406405364784
+FC Southampton		/defense/  0.12261764209816162"""
+
+# Chargement initial du fichier d'entrée
+df = pd.read_excel(input_file, engine='openpyxl')
+df.iloc[:, 3] = df.iloc[:, 3].round(2)
+df['Streak_Win'] = 0
+df['Streak_Loss'] = 0
+df['Key_Player_Absent'] = False
+
+def load_key_players():
+    key_players = {}
+    for line in key_players_data.split('\n'):
+        parts = line.strip().split("\t")
+        if len(parts) >= 2:
+            team = parts[0].strip()
+            position_prob = parts[1].strip().split('/')
+            if len(position_prob) >= 2:
+                position = position_prob[0].strip()
+                try:
+                    probability = float(position_prob[1].strip())
+                except ValueError:
+                    probability = float(position_prob[2].strip())
+                key_players[team] = {"position": position, "prob": probability, "suspended": False}
+    return key_players
+
+def load_previous_results(start_journee):
+    # Charge les résultats des journées précédentes (avant start_journee)
+    for journee in range(1, start_journee):
+        col_start = j + (journee - 1) * 6
+        for i in range(N):
+            if not pd.isna(df.iloc[i, col_start + 1]):
+                df.at[i, f'Jour {journee} F.O Maj'] = df.iloc[i, col_start + 1]
+                df.at[i, f'Jour {journee} F.D Maj'] = df.iloc[i, col_start + 2]
+
+def generate_schedule(num_teams):
+    teams = list(range(1, num_teams + 1))
+    matches = []
+    n = len(teams)
+    for i in range(n - 1):
+        round_matches = []
+        for j in range(n // 2):
+            match = (teams[j], teams[n - 1 - j])
+            round_matches.append(match)
+        matches.append(round_matches)
+        teams = [teams[0]] + [teams[-1]] + teams[1:-1]
+    return_matches = []
+    for round_matches in matches:
+        return_round = [(away, home) for home, away in round_matches]
+        return_matches.append(return_round)
+    return matches + return_matches
+
+def update_streaks(i_A, i_B, points_A, points_B):
+    if points_A == 3:
+        df.at[i_A, 'Streak_Win'] += 1
+        df.at[i_A, 'Streak_Loss'] = 0
+        df.at[i_B, 'Streak_Win'] = 0
+        df.at[i_B, 'Streak_Loss'] += 1
+    elif points_B == 3:
+        df.at[i_B, 'Streak_Win'] += 1
+        df.at[i_B, 'Streak_Loss'] = 0
+        df.at[i_A, 'Streak_Win'] = 0
+        df.at[i_A, 'Streak_Loss'] += 1
+
+def calculate_adjustment(df, pts_reel_28):
+    total_points = df['Total_Points'].values
+    eqm = np.sqrt(np.mean((total_points - pts_reel_28)**2))
+    coef_ajustement = eqm / np.mean(pts_reel_28)
+    return eqm, coef_ajustement
+
+def compute_total_points():
+    total_points = [0] * N
+    for journee in range(1, num_journees + 1):
+        col_start = j + (journee - 1) * 6
+        for i in range(N):
+            if col_start + 3 < len(df.columns) and not pd.isna(df.iloc[i, col_start + 3]):
+                total_points[i] += df.iloc[i, col_start + 3]
+    df['Total_Points'] = total_points
+
+# Modification de la fonction simulate_key_player_absence pour utiliser les malus dynamiques
+def simulate_key_player_absence(key_players, malus_attacker, malus_midfield, malus_defense):
+    team_names = df.iloc[:, 0].tolist()
+    df['Key_Player_Absent'] = False
+    if 'FO_Original' not in df.columns:
+        df['FO_Original'] = df.iloc[:, 3].copy()
+        df['FD_Original'] = df.iloc[:, 2].copy()
+    else:
+        df.iloc[:, 3] = df['FO_Original'].copy()
+        df.iloc[:, 2] = df['FD_Original'].copy()
+    for i, team in enumerate(team_names):
+        if team in key_players:
+            if np.random.random() < key_players[team]["prob"]:
+                df.at[i, 'Key_Player_Absent'] = True
+                position = key_players[team]["position"].lower()
+                if position == "attaquant":
+                    df.iloc[i, 3] *= malus_attacker
+                elif position == "milieux":
+                    df.iloc[i, 3] *= malus_midfield
+                    df.iloc[i, 2] *= malus_midfield
+                elif position == "defense":
+                    df.iloc[i, 2] *= malus_defense
+
+def generate_scores(malus_attacker, malus_midfield, malus_defense):
+    global correlation_rho
+    key_players = load_key_players()
+    schedule = generate_schedule(N)
+    # Simulation pour chaque journée de N_journee à journee_fin
+    for journee in range(N_journee, journee_fin + 1):
+        simulate_key_player_absence(key_players, malus_attacker, malus_midfield, malus_defense)
+        col_start = j + (journee - 1) * 6
+        # Conversion explicite des colonnes destinées aux moyennes en float
+        df[df.columns[col_start+1]] = df[df.columns[col_start+1]].astype(float)
+        df[df.columns[col_start+2]] = df[df.columns[col_start+2]].astype(float)
+        matches = schedule[(journee - 1) % len(schedule)]
+        for equipe_domicile, equipe_exterieur in matches:
+            i_dom = equipe_domicile - 1
+            i_ext = equipe_exterieur - 1
+            if col_start + 5 >= len(df.columns):
+                continue
+            FO_dom_base = float(df.iloc[i_dom, 3]) * bonus_domicile_FO * (alpha_factor ** df.at[i_dom, 'Streak_Win']) * (beta_factor ** df.at[i_dom, 'Streak_Loss'])
+            FO_ext_base = float(df.iloc[i_ext, 3]) * (alpha_factor ** df.at[i_ext, 'Streak_Win']) * (beta_factor ** df.at[i_ext, 'Streak_Win'])
+            FD_dom_base = float(df.iloc[i_dom, 2])
+            FD_ext_base = float(df.iloc[i_ext, 2])
+            total_buts_dom = 0
+            total_buts_ext = 0
+            for t in range(T):
+                lambda_dom = FO_dom_base * FD_ext_base
+                lambda_ext = FO_ext_base * FD_dom_base
+                cov_value = correlation_rho * np.sqrt(lambda_dom * lambda_ext)
+                mean = [lambda_dom, lambda_ext]
+                cov = [[lambda_dom, cov_value], [cov_value, lambda_ext]]
+                scores = multivariate_normal.rvs(mean, cov)
+                score_dom = max(0.0, scores[0]) if not np.isnan(scores[0]) else 0.0
+                score_ext = max(0.0, scores[1]) if not np.isnan(scores[1]) else 0.0
+                buts_dom = np.random.poisson(score_dom)
+                buts_ext = np.random.poisson(score_ext)
+                total_buts_dom += buts_dom
+                total_buts_ext += buts_ext
+            avg_buts_dom = total_buts_dom / T
+            avg_buts_ext = total_buts_ext / T
+            points_dom = 3 if avg_buts_dom > avg_buts_ext else (1 if abs(avg_buts_dom - avg_buts_ext) < 1e-6 else 0)
+            points_ext = 3 if avg_buts_ext > avg_buts_dom else (1 if abs(avg_buts_ext - avg_buts_dom) < 1e-6 else 0)
+            df.at[i_dom, df.columns[col_start]] = f'{equipe_exterieur}_{journee}'
+            df.at[i_dom, df.columns[col_start + 2]] = float(avg_buts_dom)
+            df.at[i_dom, df.columns[col_start + 1]] = float(avg_buts_ext)
+            df.at[i_dom, df.columns[col_start + 3]] = points_dom
+            df.at[i_ext, df.columns[col_start]] = f'{equipe_domicile}_{journee}'
+            df.at[i_ext, df.columns[col_start + 2]] = float(avg_buts_ext)
+            df.at[i_ext, df.columns[col_start + 1]] = float(avg_buts_dom)
+            df.at[i_ext, df.columns[col_start + 3]] = points_ext
+            update_streaks(i_dom, i_ext, points_dom, points_ext)
+
+def calculate_adjustment(df, pts_reel_28):
+    total_points = df['Total_Points'].values
+    eqm = np.sqrt(np.mean((total_points - pts_reel_28)**2))
+    coef_ajustement = eqm / np.mean(pts_reel_28)
+    return eqm, coef_ajustement
+
+def compute_total_points():
+    total_points = [0] * N
+    for journee in range(1, num_journees + 1):
+        col_start = j + (journee - 1) * 6
+        for i in range(N):
+            if col_start + 3 < len(df.columns) and not pd.isna(df.iloc[i, col_start + 3]):
+                total_points[i] += df.iloc[i, col_start + 3]
+    df['Total_Points'] = total_points
+
+def calculate_adjustment_and_save():
+    pts_reel_28 = np.array([67,55,51,47,47,49,44,42,42,46,38,33,34,38,34,33,23,17,17,9])
+    compute_total_points()
+    eqm, coef_ajustement = calculate_adjustment(df, pts_reel_28)
+    print(f"\nEQM: {eqm:.2f}, Coefficient d'ajustement: {coef_ajustement:.2f}")
+    with pd.ExcelWriter(output_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+        adjustment_data = pd.DataFrame({
+            'EQM': [eqm],
+            "Coefficient d'ajustement": [coef_ajustement]
+        })
+        adjustment_data.to_excel(writer, sheet_name='Calcul', index=False)
+
+# Si N_journee > 1, charger les résultats précédents
+if N_journee > 1:
+    load_previous_results(N_journee)
+
+# Lancer la simulation avec la configuration optimale
+generate_scores(malus_attacker, malus_midfield, malus_defense)
+compute_total_points()
+calculate_adjustment_and_save()
+
+print("\nSimulation terminée avec la configuration optimale.")
+print(f"Le fichier modifié est sauvegardé sous {output_file}")
